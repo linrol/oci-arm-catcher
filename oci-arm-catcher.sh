@@ -286,8 +286,8 @@ while true; do
             ad_index=$(((ad_index + 1) % ${#ADS[@]}))
         fi
 
-        # Check if rate limit (429 / TooManyRequests)
-        if printf '%s' "$output" | grep -qiE "TooManyRequests|429"; then
+        # Check if rate limit (429 / TooManyRequests) using precise code/status check
+        if [[ "$error_code" == *"TooManyRequests"* || "$error_code" == "429" ]] || printf '%s' "$output" | grep -qiE '"code":\s*"TooManyRequests"|"status":\s*429'; then
             consecutive_safe=0
             if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
                 old_int=$current_interval
@@ -306,10 +306,18 @@ while true; do
             # Normal capacity or transient error
             if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
                 consecutive_safe=$((consecutive_safe + 1))
-                # If stable for 3 consecutive safe requests, probe slightly faster (-5s)
+                # If stable for 3 consecutive safe requests, probe slightly faster
                 if [ "$consecutive_safe" -ge 3 ] && [ "$current_interval" -gt "$MIN_RETRY_INTERVAL" ]; then
                     old_int=$current_interval
-                    current_interval=$((current_interval - 5))
+                    # Adaptive recovery step: larger steps when recovering from high intervals
+                    if [ "$current_interval" -ge 100 ]; then
+                        step=15
+                    elif [ "$current_interval" -ge 70 ]; then
+                        step=10
+                    else
+                        step=5
+                    fi
+                    current_interval=$((current_interval - step))
                     [ "$current_interval" -lt "$MIN_RETRY_INTERVAL" ] && current_interval=$MIN_RETRY_INTERVAL
                     echo "  ⚡ Frequency stable ($consecutive_safe safe). Probing faster: base ${old_int}s -> ${current_interval}s (min: ${MIN_RETRY_INTERVAL}s)"
                     consecutive_safe=0

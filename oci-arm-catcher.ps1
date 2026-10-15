@@ -223,7 +223,7 @@ while ($true) {
     if ($output -match $retryable) {
         if ($ads.Count -gt 1) { $adIndex = ($adIndex + 1) % $ads.Count }
 
-        if ($output -match 'TooManyRequests|429') {
+        if ($err.Code -eq 'TooManyRequests' -or $err.Code -eq '429' -or $output -match '"(code|status)"\s*:\s*("TooManyRequests"|429)') {
             $consecutiveSafe = 0
             if ($autoAdapt) {
                 $oldInt = $currentInterval
@@ -249,7 +249,8 @@ while ($true) {
                 $consecutiveSafe++
                 if ($consecutiveSafe -ge 3 -and $currentInterval -gt $minRetryInterval) {
                     $oldInt = $currentInterval
-                    $currentInterval = [math]::Max($minRetryInterval, $currentInterval - 5)
+                    $step = if ($currentInterval -ge 100) { 15 } elseif ($currentInterval -ge 70) { 10 } else { 5 }
+                    $currentInterval = [math]::Max($minRetryInterval, $currentInterval - $step)
                     Write-Host "  ⚡ Frequency stable ($consecutiveSafe safe). Probing faster: base ${oldInt}s -> ${currentInterval}s (min: ${minRetryInterval}s)" -ForegroundColor Cyan
                     $consecutiveSafe = 0
                 }
