@@ -188,8 +188,8 @@ if ! command -v oci &>/dev/null; then
 fi
 [[ $missing -eq 0 ]] || exit 1
 
-RETRY_INTERVAL="${RETRY_INTERVAL:-60}"
-MIN_RETRY_INTERVAL="${MIN_RETRY_INTERVAL:-30}"
+RETRY_INTERVAL="${RETRY_INTERVAL:-110}"
+MIN_RETRY_INTERVAL="${MIN_RETRY_INTERVAL:-108}"
 MAX_RETRY_INTERVAL="${MAX_RETRY_INTERVAL:-300}"
 
 # Robust case-insensitive boolean matching for AUTO_ADAPT_INTERVAL
@@ -232,6 +232,7 @@ attempt=0
 ad_index=0
 current_interval=$RETRY_INTERVAL
 consecutive_safe=0
+learned_min_interval="${OCI_LEARNED_FLOOR:-$MIN_RETRY_INTERVAL}"
 
 while true; do
     attempt=$((attempt + 1))
@@ -291,13 +292,18 @@ while true; do
             consecutive_safe=0
             if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
                 old_int=$current_interval
-                # Multiplicative increase / penalty backoff: 1.5x + 30s
-                current_interval=$(( (current_interval * 3 / 2) + 30 ))
-                if [ "$current_interval" -gt "$MAX_RETRY_INTERVAL" ]; then
-                    current_interval=$MAX_RETRY_INTERVAL
-                fi
+
+                # Agile backoff: step back gently (+15s, min 125s) instead of over-retreating
+                backoff=$((current_interval + 15))
+                [ "$backoff" -lt 125 ] && backoff=125
+                [ "$backoff" -gt "$MAX_RETRY_INTERVAL" ] && backoff=$MAX_RETRY_INTERVAL
+                current_interval=$backoff
+
+                # Maintain solid floor at MIN_RETRY_INTERVAL
+                [ "$learned_min_interval" -lt "$MIN_RETRY_INTERVAL" ] && learned_min_interval=$MIN_RETRY_INTERVAL
+
                 cooldown=120
-                echo "  ⚠️  Rate limit (429) hit! Backing off: base ${old_int}s -> ${current_interval}s, cooling down for ${cooldown}s..."
+                echo "  ⚠️  Rate limit (429) hit! Agile backoff: base ${old_int}s -> ${current_interval}s, cooling down for ${cooldown}s..."
                 wait_countdown "$cooldown"
             else
                 wait_countdown "$current_interval"
@@ -306,21 +312,30 @@ while true; do
             # Normal capacity or transient error
             if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
                 consecutive_safe=$((consecutive_safe + 1))
-                # If stable for 3 consecutive safe requests, probe slightly faster
-                if [ "$consecutive_safe" -ge 3 ] && [ "$current_interval" -gt "$MIN_RETRY_INTERVAL" ]; then
-                    old_int=$current_interval
-                    # Adaptive recovery step: larger steps when recovering from high intervals
-                    if [ "$current_interval" -ge 100 ]; then
-                        step=15
-                    elif [ "$current_interval" -ge 70 ]; then
-                        step=10
-                    else
-                        step=5
+                # Agile recovery tiers: quick 2-round verification to swiftly return to optimal floor
+                required_safe=2
+                probe_step=15
+                if [ "$current_interval" -ge 140 ]; then
+                    required_safe=3
+                    probe_step=15
+                else
+                    required_safe=2
+                    probe_step=15
+                fi
+
+                # Case A: Above learned floor - accelerate down to safe floor with dynamic risk tiers
+                if [ "$current_interval" -gt "$learned_min_interval" ]; then
+                    if [ "$consecutive_safe" -ge "$required_safe" ]; then
+                        old_int=$current_interval
+                        current_interval=$((current_interval - probe_step))
+                        [ "$current_interval" -lt "$learned_min_interval" ] && current_interval=$learned_min_interval
+                        if [ "$current_interval" -eq "$learned_min_interval" ]; then
+                            echo "  🔒 Reached optimal safe floor ($consecutive_safe safe). Locked at steady base ${current_interval}s (with ±15% jitter)"
+                        else
+                            echo "  ⚡ Frequency stable ($consecutive_safe safe). Accelerating: base ${old_int}s -> ${current_interval}s (floor: ${learned_min_interval}s)"
+                        fi
+                        consecutive_safe=0
                     fi
-                    current_interval=$((current_interval - step))
-                    [ "$current_interval" -lt "$MIN_RETRY_INTERVAL" ] && current_interval=$MIN_RETRY_INTERVAL
-                    echo "  ⚡ Frequency stable ($consecutive_safe safe). Probing faster: base ${old_int}s -> ${current_interval}s (min: ${MIN_RETRY_INTERVAL}s)"
-                    consecutive_safe=0
                 fi
                 wait_seconds=$(calculate_jittered_interval "$current_interval")
             else

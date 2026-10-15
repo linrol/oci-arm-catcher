@@ -94,8 +94,8 @@ if (-not (Get-Command oci -ErrorAction SilentlyContinue)) {
 }
 if ($missing) { exit 1 }
 
-$retryInterval = if ($cfg.ContainsKey('RETRY_INTERVAL') -and $cfg['RETRY_INTERVAL']) { [int]$cfg['RETRY_INTERVAL'] } else { 60 }
-$minRetryInterval = if ($cfg.ContainsKey('MIN_RETRY_INTERVAL') -and $cfg['MIN_RETRY_INTERVAL']) { [int]$cfg['MIN_RETRY_INTERVAL'] } else { 30 }
+$retryInterval = if ($cfg.ContainsKey('RETRY_INTERVAL') -and $cfg['RETRY_INTERVAL']) { [int]$cfg['RETRY_INTERVAL'] } else { 110 }
+$minRetryInterval = if ($cfg.ContainsKey('MIN_RETRY_INTERVAL') -and $cfg['MIN_RETRY_INTERVAL']) { [int]$cfg['MIN_RETRY_INTERVAL'] } else { 108 }
 $maxRetryInterval = if ($cfg.ContainsKey('MAX_RETRY_INTERVAL') -and $cfg['MAX_RETRY_INTERVAL']) { [int]$cfg['MAX_RETRY_INTERVAL'] } else { 300 }
 $autoAdapt = if ($cfg.ContainsKey('AUTO_ADAPT_INTERVAL')) { $cfg['AUTO_ADAPT_INTERVAL'] -match '^(true|1|yes)$' } else { $true }
 
@@ -180,6 +180,7 @@ $attempt = 0
 $adIndex = 0
 $currentInterval = $retryInterval
 $consecutiveSafe = 0
+$learnedMinInterval = if ($env:OCI_LEARNED_FLOOR) { [int]$env:OCI_LEARNED_FLOOR } else { $minRetryInterval }
 
 while ($true) {
     $attempt++
@@ -226,11 +227,17 @@ while ($true) {
         if ($err.Code -eq 'TooManyRequests' -or $err.Code -eq '429' -or $output -match '"(code|status)"\s*:\s*("TooManyRequests"|429)') {
             $consecutiveSafe = 0
             if ($autoAdapt) {
-                $oldInt = $currentInterval
-                $currentInterval = [int](($currentInterval * 1.5) + 30)
-                if ($currentInterval -gt $maxRetryInterval) { $currentInterval = $maxRetryInterval }
+                # Agile backoff: step back gently (+15s, min 125s) instead of over-retreating
+                $backoff = $currentInterval + 15
+                if ($backoff -lt 125) { $backoff = 125 }
+                if ($backoff -gt $maxRetryInterval) { $backoff = $maxRetryInterval }
+                $currentInterval = $backoff
+
+                # Maintain solid floor at minRetryInterval
+                if ($learnedMinInterval -lt $minRetryInterval) { $learnedMinInterval = $minRetryInterval }
+
                 $cooldown = 120
-                Write-Host "  ⚠️  Rate limit (429) hit! Backing off: base ${oldInt}s -> ${currentInterval}s, cooling down for ${cooldown}s..." -ForegroundColor Yellow
+                Write-Host "  ⚠️  Rate limit (429) hit! Agile backoff: base ${oldInt}s -> ${currentInterval}s, cooling down for ${cooldown}s..." -ForegroundColor Yellow
                 for ($rem = $cooldown; $rem -gt 0; $rem--) {
                     Write-Host -NoNewline ("`r  ⏳ {0:00}:{1:00} until next attempt (cooling down)" -f [math]::Floor($rem / 60), ($rem % 60))
                     Start-Sleep -Seconds 1
@@ -247,12 +254,29 @@ while ($true) {
             $waitSec = $currentInterval
             if ($autoAdapt) {
                 $consecutiveSafe++
-                if ($consecutiveSafe -ge 3 -and $currentInterval -gt $minRetryInterval) {
-                    $oldInt = $currentInterval
-                    $step = if ($currentInterval -ge 100) { 15 } elseif ($currentInterval -ge 70) { 10 } else { 5 }
-                    $currentInterval = [math]::Max($minRetryInterval, $currentInterval - $step)
-                    Write-Host "  ⚡ Frequency stable ($consecutiveSafe safe). Probing faster: base ${oldInt}s -> ${currentInterval}s (min: ${minRetryInterval}s)" -ForegroundColor Cyan
-                    $consecutiveSafe = 0
+                # Agile recovery tiers: quick 2-round verification to swiftly return to optimal floor
+                $requiredSafe = 2
+                $probeStep = 15
+                if ($currentInterval -ge 140) {
+                    $requiredSafe = 3
+                    $probeStep = 15
+                } else {
+                    $requiredSafe = 2
+                    $probeStep = 15
+                }
+
+                # Case A: Above learned floor - accelerate down to safe floor with dynamic risk tiers
+                if ($currentInterval -gt $learnedMinInterval) {
+                    if ($consecutiveSafe -ge $requiredSafe) {
+                        $oldInt = $currentInterval
+                        $currentInterval = [math]::Max($learnedMinInterval, $currentInterval - $probeStep)
+                        if ($currentInterval -eq $learnedMinInterval) {
+                            Write-Host "  🔒 Reached optimal safe floor ($consecutiveSafe safe). Locked at steady base ${currentInterval}s (with ±15% jitter)" -ForegroundColor Green
+                        } else {
+                            Write-Host "  ⚡ Frequency stable ($consecutiveSafe safe). Accelerating: base ${oldInt}s -> ${currentInterval}s (floor: ${learnedMinInterval}s)" -ForegroundColor Cyan
+                        }
+                        $consecutiveSafe = 0
+                    }
                 }
                 $waitSec = Get-JitteredInterval $currentInterval
             }
