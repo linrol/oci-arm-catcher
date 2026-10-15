@@ -94,7 +94,10 @@ if (-not (Get-Command oci -ErrorAction SilentlyContinue)) {
 }
 if ($missing) { exit 1 }
 
-$retryInterval = if ($cfg.ContainsKey('RETRY_INTERVAL') -and $cfg['RETRY_INTERVAL']) { [int]$cfg['RETRY_INTERVAL'] } else { 300 }
+$retryInterval = if ($cfg.ContainsKey('RETRY_INTERVAL') -and $cfg['RETRY_INTERVAL']) { [int]$cfg['RETRY_INTERVAL'] } else { 60 }
+$minRetryInterval = if ($cfg.ContainsKey('MIN_RETRY_INTERVAL') -and $cfg['MIN_RETRY_INTERVAL']) { [int]$cfg['MIN_RETRY_INTERVAL'] } else { 30 }
+$maxRetryInterval = if ($cfg.ContainsKey('MAX_RETRY_INTERVAL') -and $cfg['MAX_RETRY_INTERVAL']) { [int]$cfg['MAX_RETRY_INTERVAL'] } else { 300 }
+$autoAdapt = if ($cfg.ContainsKey('AUTO_ADAPT_INTERVAL')) { $cfg['AUTO_ADAPT_INTERVAL'] -eq 'true' -or $cfg['AUTO_ADAPT_INTERVAL'] -eq '1' } else { $true }
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -139,6 +142,13 @@ function Get-OciError {
     [pscustomobject]@{ Code = $code; Message = if ($msg) { $msg } else { 'no message' } }
 }
 
+function Get-JitteredInterval {
+    param([int]$Base)
+    $jitterPercent = (Get-Random -Minimum -15 -Maximum 16) / 100.0
+    $res = [math]::Round($Base * (1.0 + $jitterPercent))
+    return [math]::Max(1, [int]$res)
+}
+
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
 Write-Host "=== oci-arm-catcher started at $(Get-Date) ==="
@@ -148,13 +158,23 @@ if ($ads.Count -gt 1) {
 } else {
     Write-Host "Availability Domain: $($ads[0])"
 }
-Write-Host "Retry interval: $([math]::Floor($retryInterval / 60)) min`n"
+
+if ($autoAdapt) {
+    Write-Host "Adaptive polling: ENABLED"
+    Write-Host "  -> Target safe interval : [${minRetryInterval}s .. ${maxRetryInterval}s]"
+    Write-Host "  -> Initial base interval: ${retryInterval}s (with ±15% jitter)"
+} else {
+    Write-Host "Retry interval: ${retryInterval}s (fixed)"
+}
+Write-Host ""
 
 $retryable = 'out of capacity|out of host capacity|InternalError|LimitExceeded|TooManyRequests|timed out|RequestException|ServiceUnavailable|Service Unavailable'
 $shapeConfig = "{`"ocpus`": $($cfg['OCPUS']), `"memoryInGBs`": $($cfg['MEMORY_GB'])}"
 
 $attempt = 0
 $adIndex = 0
+$currentInterval = $retryInterval
+$consecutiveSafe = 0
 
 while ($true) {
     $attempt++
@@ -197,11 +217,46 @@ while ($true) {
 
     if ($output -match $retryable) {
         if ($ads.Count -gt 1) { $adIndex = ($adIndex + 1) % $ads.Count }
-        for ($rem = $retryInterval; $rem -gt 0; $rem--) {
-            Write-Host -NoNewline ("`r  ⏳ {0:00}:{1:00} until next attempt" -f [math]::Floor($rem / 60), ($rem % 60))
-            Start-Sleep -Seconds 1
+
+        if ($output -match 'TooManyRequests') {
+            $consecutiveSafe = 0
+            if ($autoAdapt) {
+                $oldInt = $currentInterval
+                $currentInterval = [int](($currentInterval * 1.5) + 30)
+                if ($currentInterval -gt $maxRetryInterval) { $currentInterval = $maxRetryInterval }
+                $cooldown = 120
+                Write-Host "  ⚠️  Rate limit (429) hit! Backing off: base ${oldInt}s -> ${currentInterval}s, cooling down for ${cooldown}s..." -ForegroundColor Yellow
+                for ($rem = $cooldown; $rem -gt 0; $rem--) {
+                    Write-Host -NoNewline ("`r  ⏳ {0:00}:{1:00} until next attempt (cooling down)" -f [math]::Floor($rem / 60), ($rem % 60))
+                    Start-Sleep -Seconds 1
+                }
+                Write-Host "`r$((' ' * 50))`r" -NoNewline
+            } else {
+                for ($rem = $currentInterval; $rem -gt 0; $rem--) {
+                    Write-Host -NoNewline ("`r  ⏳ {0:00}:{1:00} until next attempt" -f [math]::Floor($rem / 60), ($rem % 60))
+                    Start-Sleep -Seconds 1
+                }
+                Write-Host "`r$((' ' * 40))`r" -NoNewline
+            }
+        } else {
+            $waitSec = $currentInterval
+            if ($autoAdapt) {
+                $consecutiveSafe++
+                if ($consecutiveSafe -ge 3 -and $currentInterval -gt $minRetryInterval) {
+                    $oldInt = $currentInterval
+                    $currentInterval = [math]::Max($minRetryInterval, $currentInterval - 5)
+                    Write-Host "  ⚡ Frequency stable ($consecutiveSafe safe). Probing faster: base ${oldInt}s -> ${currentInterval}s (min: ${minRetryInterval}s)" -ForegroundColor Cyan
+                    $consecutiveSafe = 0
+                }
+                $waitSec = Get-JitteredInterval $currentInterval
+            }
+
+            for ($rem = $waitSec; $rem -gt 0; $rem--) {
+                Write-Host -NoNewline ("`r  ⏳ {0:00}:{1:00} until next attempt" -f [math]::Floor($rem / 60), ($rem % 60))
+                Start-Sleep -Seconds 1
+            }
+            Write-Host "`r$((' ' * 40))`r" -NoNewline
         }
-        Write-Host "`r$((' ' * 40))`r" -NoNewline
     } else {
         Write-Host "  -> Unexpected error, stopping." -ForegroundColor Red
         Write-Host $output

@@ -80,6 +80,17 @@ is_retryable() {
     printf '%s' "$1" | grep -qiE "$RETRYABLE_ERRORS"
 }
 
+# Calculate wait time with random jitter (±15%) to avoid thundering herd and signature detection.
+calculate_jittered_interval() {
+    local base=$1
+    python3 -c "
+import random
+base = $base
+jitter = random.uniform(-0.15, 0.15)
+print(max(1, int(round(base * (1 + jitter)))))
+" 2>/dev/null || echo "$base"
+}
+
 # Spinner — interactive terminals only.
 spin() {
     local pid=$1 msg="$2" i=0
@@ -176,7 +187,10 @@ if ! command -v oci &>/dev/null; then
 fi
 [[ $missing -eq 0 ]] || exit 1
 
-RETRY_INTERVAL="${RETRY_INTERVAL:-300}"
+RETRY_INTERVAL="${RETRY_INTERVAL:-60}"
+MIN_RETRY_INTERVAL="${MIN_RETRY_INTERVAL:-30}"
+MAX_RETRY_INTERVAL="${MAX_RETRY_INTERVAL:-300}"
+AUTO_ADAPT_INTERVAL="${AUTO_ADAPT_INTERVAL:-true}"
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
@@ -187,11 +201,20 @@ if [ ${#ADS[@]} -gt 1 ]; then
 else
     echo "Availability Domain: ${ADS[0]}"
 fi
-echo "Retry interval: $((RETRY_INTERVAL / 60)) min"
+
+if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
+    echo "Adaptive polling: ENABLED"
+    echo "  -> Target safe interval : [${MIN_RETRY_INTERVAL}s .. ${MAX_RETRY_INTERVAL}s]"
+    echo "  -> Initial base interval: ${RETRY_INTERVAL}s (with ±15% jitter)"
+else
+    echo "Retry interval: ${RETRY_INTERVAL}s (fixed)"
+fi
 echo ""
 
 attempt=0
 ad_index=0
+current_interval=$RETRY_INTERVAL
+consecutive_safe=0
 
 while true; do
     attempt=$((attempt + 1))
@@ -245,7 +268,41 @@ while true; do
         if [ ${#ADS[@]} -gt 1 ]; then
             ad_index=$(((ad_index + 1) % ${#ADS[@]}))
         fi
-        wait_countdown "$RETRY_INTERVAL"
+
+        # Check if rate limit (429 / TooManyRequests)
+        if printf '%s' "$output" | grep -qiE "TooManyRequests"; then
+            consecutive_safe=0
+            if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
+                old_int=$current_interval
+                # Multiplicative increase / penalty backoff: 1.5x + 30s
+                current_interval=$(( (current_interval * 3 / 2) + 30 ))
+                if [ "$current_interval" -gt "$MAX_RETRY_INTERVAL" ]; then
+                    current_interval=$MAX_RETRY_INTERVAL
+                fi
+                cooldown=120
+                echo "  ⚠️  Rate limit (429) hit! Backing off: base ${old_int}s -> ${current_interval}s, cooling down for ${cooldown}s..."
+                wait_countdown "$cooldown"
+            else
+                wait_countdown "$current_interval"
+            fi
+        else
+            # Normal capacity or transient error
+            if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
+                consecutive_safe=$((consecutive_safe + 1))
+                # If stable for 3 consecutive safe requests, probe slightly faster (-5s)
+                if [ "$consecutive_safe" -ge 3 ] && [ "$current_interval" -gt "$MIN_RETRY_INTERVAL" ]; then
+                    old_int=$current_interval
+                    current_interval=$((current_interval - 5))
+                    [ "$current_interval" -lt "$MIN_RETRY_INTERVAL" ] && current_interval=$MIN_RETRY_INTERVAL
+                    echo "  ⚡ Frequency stable ($consecutive_safe safe). Probing faster: base ${old_int}s -> ${current_interval}s (min: ${MIN_RETRY_INTERVAL}s)"
+                    consecutive_safe=0
+                fi
+                wait_seconds=$(calculate_jittered_interval "$current_interval")
+            else
+                wait_seconds=$current_interval
+            fi
+            wait_countdown "$wait_seconds"
+        fi
     else
         echo "  -> Unexpected error, stopping." >&2
         printf '%s\n' "$output" >&2
