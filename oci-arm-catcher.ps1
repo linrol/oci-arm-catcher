@@ -97,7 +97,12 @@ if ($missing) { exit 1 }
 $retryInterval = if ($cfg.ContainsKey('RETRY_INTERVAL') -and $cfg['RETRY_INTERVAL']) { [int]$cfg['RETRY_INTERVAL'] } else { 60 }
 $minRetryInterval = if ($cfg.ContainsKey('MIN_RETRY_INTERVAL') -and $cfg['MIN_RETRY_INTERVAL']) { [int]$cfg['MIN_RETRY_INTERVAL'] } else { 30 }
 $maxRetryInterval = if ($cfg.ContainsKey('MAX_RETRY_INTERVAL') -and $cfg['MAX_RETRY_INTERVAL']) { [int]$cfg['MAX_RETRY_INTERVAL'] } else { 300 }
-$autoAdapt = if ($cfg.ContainsKey('AUTO_ADAPT_INTERVAL')) { $cfg['AUTO_ADAPT_INTERVAL'] -eq 'true' -or $cfg['AUTO_ADAPT_INTERVAL'] -eq '1' } else { $true }
+$autoAdapt = if ($cfg.ContainsKey('AUTO_ADAPT_INTERVAL')) { $cfg['AUTO_ADAPT_INTERVAL'] -match '^(true|1|yes)$' } else { $true }
+
+# Sanity checks for interval boundaries
+if ($minRetryInterval -gt $maxRetryInterval) { $minRetryInterval = $maxRetryInterval }
+if ($retryInterval -lt $minRetryInterval) { $minRetryInterval = $retryInterval }
+if ($retryInterval -gt $maxRetryInterval) { $retryInterval = $maxRetryInterval }
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -218,7 +223,7 @@ while ($true) {
     if ($output -match $retryable) {
         if ($ads.Count -gt 1) { $adIndex = ($adIndex + 1) % $ads.Count }
 
-        if ($output -match 'TooManyRequests') {
+        if ($output -match 'TooManyRequests|429') {
             $consecutiveSafe = 0
             if ($autoAdapt) {
                 $oldInt = $currentInterval

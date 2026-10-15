@@ -83,12 +83,13 @@ is_retryable() {
 # Calculate wait time with random jitter (±15%) to avoid thundering herd and signature detection.
 calculate_jittered_interval() {
     local base=$1
-    python3 -c "
-import random
-base = $base
-jitter = random.uniform(-0.15, 0.15)
-print(max(1, int(round(base * (1 + jitter)))))
-" 2>/dev/null || echo "$base"
+    # Pure bash jitter calculation (-15% to +15%) without external subprocess overhead
+    local pct=$(( (RANDOM % 31) - 15 ))
+    local res=$(( base + (base * pct / 100) ))
+    if [ "$res" -lt 1 ]; then
+        res=1
+    fi
+    echo "$res"
 }
 
 # Spinner — interactive terminals only.
@@ -190,7 +191,23 @@ fi
 RETRY_INTERVAL="${RETRY_INTERVAL:-60}"
 MIN_RETRY_INTERVAL="${MIN_RETRY_INTERVAL:-30}"
 MAX_RETRY_INTERVAL="${MAX_RETRY_INTERVAL:-300}"
-AUTO_ADAPT_INTERVAL="${AUTO_ADAPT_INTERVAL:-true}"
+
+# Robust case-insensitive boolean matching for AUTO_ADAPT_INTERVAL
+case "${AUTO_ADAPT_INTERVAL:-true}" in
+    [Tt][Rr][Uu][Ee]|1|[Yy][Ee][Ss]) AUTO_ADAPT_INTERVAL=true ;;
+    *) AUTO_ADAPT_INTERVAL=false ;;
+esac
+
+# Sanity checks for interval boundaries (prevents misconfiguration)
+if [ "$MIN_RETRY_INTERVAL" -gt "$MAX_RETRY_INTERVAL" ]; then
+    MIN_RETRY_INTERVAL=$MAX_RETRY_INTERVAL
+fi
+if [ "$RETRY_INTERVAL" -lt "$MIN_RETRY_INTERVAL" ]; then
+    MIN_RETRY_INTERVAL=$RETRY_INTERVAL
+fi
+if [ "$RETRY_INTERVAL" -gt "$MAX_RETRY_INTERVAL" ]; then
+    RETRY_INTERVAL=$MAX_RETRY_INTERVAL
+fi
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
@@ -270,7 +287,7 @@ while true; do
         fi
 
         # Check if rate limit (429 / TooManyRequests)
-        if printf '%s' "$output" | grep -qiE "TooManyRequests"; then
+        if printf '%s' "$output" | grep -qiE "TooManyRequests|429"; then
             consecutive_safe=0
             if [[ "$AUTO_ADAPT_INTERVAL" == "true" ]]; then
                 old_int=$current_interval
